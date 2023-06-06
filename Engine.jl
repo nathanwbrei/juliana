@@ -42,35 +42,36 @@ module Engine
 
     function test_source(pool, emitted)
         println("Entering test_source")
-        for i in 1:10
-            event = take!(pool)
-            push!(event, "emit event nr $(i)")
-            println("emit event nr $(i) on thread $(Threads.threadid())")
-            put!(emitted, event)
+        try
+            for i in 1:10
+                event = take!(pool)
+                push!(event, "emit event nr $(i)")
+                println("emit event nr $(i) on thread $(Threads.threadid())")
+                put!(emitted, event)
+            end
+            close(emitted)
+            println("Source has shut down naturally")
+        catch
+            # Catch take! excepting because pool
+            close(emitted)
+            println("Source interrupted by user")
         end
-        for i in 1:Threads.nthreads()
-            put!(emitted, :shutdown)
-            println("Source: Emitting shutdown signal")
-        end
-        println("Source is shutting down, finished broadcasting the shutdown signal")
     end
 
     function test_proc(emitted, pool)
         println("Entering test_proc")
-        shutdown = false
-        while !shutdown
-            event = take!(emitted)
-            if event == :shutdown
-                println("process: Shutdown received on thread $(Threads.threadid())")
-                shutdown = true
-            else
+        try
+            while true
+                event = take!(emitted)
                 push!(event, "process")
                 println("process(): $(event) on thread $(Threads.threadid())")
                 empty!(event)
+                put!(pool, event)
             end
+        catch
+            println("process: Shutdown received on thread $(Threads.threadid())")
             put!(pool, event)
         end
-        println("Processor is shutting down")
     end
 
     function run_basic_example()
@@ -84,12 +85,10 @@ module Engine
 #                 for i in pool
 #                     @show i
 #                 end
-                println("emitted contains: ")
-                for i in emitted
-                    @show i
-                end
-
-
+#                 println("emitted contains: ")
+#                 for i in emitted
+#                     @show i
+#                 end
             end
         end
 
