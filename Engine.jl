@@ -13,19 +13,25 @@ julia>
 """
 module Engine
 
+    import Base.Threads.@spawn
+
     function run(event_source, event_processor)
+        nthreads = Threads.nthreads()
+        println("Starting run() with nthreads = $(nthreads)")
         pool = Channel(10)
         for i in 1:4
             println("pool()")
             put!(pool, ["pool"])
         end
         emitted = Channel(10)
-        src_task = @async event_source(pool, emitted)
+        src_task = @spawn event_source(pool, emitted)
         println("Submitted src_task")
-        process_task = @async event_processor(emitted, pool)
-        println("Submitted process_task")
+
+        Threads.@threads for x in 1:nthreads
+            event_processor(emitted, pool)
+            println("Submitted process_task")
+        end
         wait(src_task)
-        wait(process_task)
     end
 
     function test_source(pool, emitted)
@@ -33,7 +39,7 @@ module Engine
         for i in 1:10
             event = take!(pool)
             push!(event, "emit event nr $(i)")
-            println("emit event nr $(i)")
+            println("emit event nr $(i) on thread $(Threads.threadid())")
             put!(emitted, event)
         end
     end
@@ -43,7 +49,7 @@ module Engine
         for i in 1:10
             event = take!(emitted)
             push!(event, "process")
-            println("process(): $(event)")
+            println("process(): $(event) on thread $(Threads.threadid())")
             empty!(event)
             put!(pool, event)
         end
