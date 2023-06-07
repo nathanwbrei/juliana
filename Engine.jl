@@ -16,7 +16,7 @@ module Engine
     mutable struct Arrow
         name::String
         execute::Function
-        data::Any
+        state::Any
         input_channel::Channel
         output_channel::Channel
         max_parallelism::Int64
@@ -26,30 +26,63 @@ module Engine
 
     import Base.Threads.@spawn
 
+    function worker(arrow::Arrow, id::Int64)
+        println("Arrow '$(arrow.name)': Launched worker $(id)");
+        while true
+            try
+                if arrow.input_channel == nothing
+                    event = ()
+                else
+                    event = take!(arrow.input_channel)
+                end
+                result = arrow.execute(event, arrow.state)
+                if (result == :shutdown)
+                    println("Arrow '$(arrow.name)': worker $(id) shutting down.")
+                    break;
+                end
+                if arrow.output_channel != nothing
+                    put!(arrow.output_channel, result)
+                end
+                println("Arrow '$(arrow.name)': worker $(id), thread $(Threads.threadid()): $(result)")
+            catch ex
+                if (isa(ex, InvalidStateException))
+                    # InvalidStateException => channel is closed and empty, no more work coming
+                    println("Arrow '$(arrow.name)': worker $(id) shutting down.")
+                    break;
+                else
+                    rethrow(ex)
+                    # All other exceptions are displayed at the end of run
+                end
+            end
+        end
+
+
+    end
+
     function run(arrows; nthreads=Threads.nthreads())
         println("Starting run() with nthreads = $(nthreads)")
         for arrow in arrows
-            for i in 1:arrow.max_parallelism
-                push!(arrow.worker_tasks, @spawn begin; println("Launched worker task $(i) for arrow $(arrow.name)"); arrow.execute(arrow.data, arrow.input_channel, arrow.output_channel); end)
+            for id in 1:arrow.max_parallelism
+                push!(arrow.worker_tasks, @spawn worker(arrow, id))
             end
 
             arrow.shutdown_task = @spawn begin
-                println("Launched shutdown task for arrow $(arrow.name)")
+                println("Arrow '$(arrow.name)': Launched shutdown task")
                 for w in arrow.worker_tasks
                     wait(w)
                 end
                 close(arrow.output_channel)
             end
-            println("Started arrow $(arrow.name)")
+            println("Arrow '$(arrow.name)': All workers have started")
         end
         println("All workers have started")
         try
             Base.exit_on_sigint(false)
             for arrow in arrows
                 wait(arrow.shutdown_task)
-                println("Shut down arrow $(arrow.name)")
+                println("Arrow '$(arrow.name)': All workers have shut down")
             end
-            println("All worker threads joined")
+            println("All workers have shut down")
         catch ex
             @show ex
             if isa(ex, TaskFailedException)
@@ -61,47 +94,30 @@ module Engine
         end
     end
 
-    function test_source(data, input_ch, output_ch)
-        for i in 1:200
-            try
-                event = take!(input_ch)
-                push!(event, "emit $(i)")
-                println("emit event nr $(i) on thread $(Threads.threadid())")
-                put!(output_ch, event)
-            catch
-                println("Source: Input channel closed! Worker shutting down.")
-                break
-            end
+    function test_source(event, state)
+        if state.last_event<state.max_event_count
+            state.last_event += 1
+            fresh_event = ["emit $(state.last_event)"]
+            return fresh_event
+        else
+            return :shutdown
         end
     end
 
-    function test_map(data, input_ch, output_ch)
-        while true
-            try
-                event = take!(input_ch)
-                push!(event, "map")
-                println("map(): $(event) on thread $(Threads.threadid())")
-                put!(output_ch, event)
-            catch
-                println("Map: Input channel closed! Worker shutting down.")
-                break;
-            end
-        end
+    function test_map(event, state)
+        push!(event, "map")
+        return event
     end
 
-    function test_reduce(data, input_ch, output_ch)
-        while true
-            try
-                event = take!(input_ch)
-                push!(event, "reduce")
-                println("reduce(): $(event) on thread $(Threads.threadid())")
-                empty!(event)
-                put!(output_ch, event)
-            catch
-                println("Reduce: Input channel closed! Worker shutting down.")
-                break;
-            end
-        end
+    function test_reduce(event, state)
+        push!(event, "reduce")
+        return event
+    end
+
+
+    mutable struct SourceState
+        last_event::Int64
+        max_event_count::Int64
     end
 
     function run_basic_example()
@@ -110,26 +126,29 @@ module Engine
         emitted = Channel(10)
         mapped = Channel(10)
         for i in 1:8
-            put!(pool, [])
+            put!(pool, Vector{String}())
         end
-        source = Arrow("source", test_source, nothing, pool, emitted, 1, [], nothing)
+        source = Arrow("source", test_source, SourceState(0, 12), pool, emitted, 1, [], nothing)
         map = Arrow("map", test_map, nothing, emitted, mapped, 4, [], nothing)
         reduce = Arrow("reduce", test_reduce, nothing, mapped, pool, 1, [], nothing)
         topology = [source, map, reduce]
         run(topology)
 
+        println("------------")
+        println("Run finished.")
+
         for arrow in topology
             for (id,task) in enumerate(arrow.worker_tasks)
                 if (istaskfailed(task))
-                    println("Arrow $(arrow.name): worker $(id): $(task.result)")
+                    println("Arrow '$(arrow.name)': worker $(id): $(task.result)")
                 else
-                    println("Arrow $(arrow.name): worker $(id): Success")
+#                     println("Arrow '$(arrow.name)': worker $(id): Success")
                 end
             end
             if (istaskfailed(arrow.shutdown_task))
-                println("Arrow $(arrow.name): shutdown: $(arrow.shutdown_task.result)")
+                println("Arrow '$(arrow.name)': shutdown: $(arrow.shutdown_task.result)")
             else
-                println("Arrow $(arrow.name): shutdown: Success")
+#                 println("Arrow '$(arrow.name)': shutdown: Success")
             end
         end
     end
