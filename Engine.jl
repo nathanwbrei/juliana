@@ -40,10 +40,10 @@ module Engine
                     println("Arrow '$(arrow.name)': worker $(id) shutting down.")
                     break;
                 end
+                println("Arrow '$(arrow.name)': worker $(id), thread $(Threads.threadid()): $(result)")
                 if arrow.output_channel != nothing
                     put!(arrow.output_channel, result)
                 end
-                println("Arrow '$(arrow.name)': worker $(id), thread $(Threads.threadid()): $(result)")
             catch ex
                 if (isa(ex, InvalidStateException))
                     # InvalidStateException => channel is closed and empty, no more work coming
@@ -94,10 +94,18 @@ module Engine
         end
     end
 
+    function spin(time_ms)
+        s = 0
+        for i = 1:time_ms
+            s += sum(rand(300,300).^2)
+        end
+        return s
+    end
+
     function test_source(event, state)
         if state.last_event<state.max_event_count
             state.last_event += 1
-            fresh_event = ["emit $(state.last_event)"]
+            fresh_event = ["emit $(state.last_event) $(spin(100))"]
             return fresh_event
         else
             return :shutdown
@@ -105,15 +113,14 @@ module Engine
     end
 
     function test_map(event, state)
-        push!(event, "map")
+        push!(event, "map $(spin(500))")
         return event
     end
 
     function test_reduce(event, state)
-        push!(event, "reduce")
+        push!(event, "reduce $(spin(200))")
         return event
     end
-
 
     mutable struct SourceState
         last_event::Int64
@@ -122,13 +129,15 @@ module Engine
 
     function run_basic_example()
         println("Running basic example")
-        pool = Channel(10)
-        emitted = Channel(10)
-        mapped = Channel(10)
-        for i in 1:8
-            put!(pool, Vector{String}())
+        pool = Channel(20)
+        emitted = Channel(20)
+        mapped = Channel(20)
+        @spawn begin
+            for i in 1:20
+                put!(pool, Vector{String}())
+            end
         end
-        source = Arrow("source", test_source, SourceState(0, 12), pool, emitted, 1, [], nothing)
+        source = Arrow("source", test_source, SourceState(0, 120), pool, emitted, 1, [], nothing)
         map = Arrow("map", test_map, nothing, emitted, mapped, 4, [], nothing)
         reduce = Arrow("reduce", test_reduce, nothing, mapped, pool, 1, [], nothing)
         topology = [source, map, reduce]
