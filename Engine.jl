@@ -13,88 +13,126 @@ julia>
 """
 module Engine
 
+    mutable struct Arrow
+        name::String
+        execute::Function
+        data::Any
+        input_channel::Channel
+        output_channel::Channel
+        max_parallelism::Int64
+        worker_tasks::Vector{Task}
+        shutdown_task::Union{Task,Nothing}
+    end
+
     import Base.Threads.@spawn
 
-    pool = Channel(10)
-    emitted = Channel(10)
-
-    function run(event_source, event_processor)
-        nthreads = Threads.nthreads()
+    function run(arrows; nthreads=Threads.nthreads())
         println("Starting run() with nthreads = $(nthreads)")
-        for i in 1:4
-            println("pool()")
-            put!(pool, ["pool"])
-        end
-        src_task = @spawn event_source(pool, emitted)
-        println("Submitted src_task")
+        for arrow in arrows
+            for i in 1:arrow.max_parallelism
+                push!(arrow.worker_tasks, @spawn begin; println("Launched worker task $(i) for arrow $(arrow.name)"); arrow.execute(arrow.data, arrow.input_channel, arrow.output_channel); end)
+            end
 
-        proc_tasks = []
-        for i in 1:nthreads
-            push!(proc_tasks, @spawn event_processor(emitted, pool))
-            println("Submitted process_task")
+            arrow.shutdown_task = @spawn begin
+                println("Launched shutdown task for arrow $(arrow.name)")
+                for w in arrow.worker_tasks
+                    wait(w)
+                end
+                close(arrow.output_channel)
+            end
+            println("Started arrow $(arrow.name)")
         end
-        for i in 1:nthreads
-            wait(proc_tasks[i])
+        println("All workers have started")
+        try
+            Base.exit_on_sigint(false)
+            for arrow in arrows
+                wait(arrow.shutdown_task)
+                println("Shut down arrow $(arrow.name)")
+            end
+            println("All worker threads joined")
+        catch ex
+            @show ex
+            if isa(ex, TaskFailedException)
+                println(ex.task.exception)
+            end
+            if isa(ex, InterruptException)
+                println("Interrupted! Exiting")
+            end
         end
-        wait(src_task)
-        println("All threads have joined")
     end
 
-    function test_source(pool, emitted)
-        println("Entering test_source")
-        try
-            for i in 1:10
-                event = take!(pool)
-                push!(event, "emit event nr $(i)")
+    function test_source(data, input_ch, output_ch)
+        for i in 1:200
+            try
+                event = take!(input_ch)
+                push!(event, "emit $(i)")
                 println("emit event nr $(i) on thread $(Threads.threadid())")
-                put!(emitted, event)
+                put!(output_ch, event)
+            catch
+                println("Source: Input channel closed! Worker shutting down.")
+                break
             end
-            close(emitted)
-            println("Source has shut down naturally")
-        catch
-            # Catch take! excepting because pool
-            close(emitted)
-            println("Source interrupted by user")
         end
     end
 
-    function test_proc(emitted, pool)
-        println("Entering test_proc")
-        try
-            while true
-                event = take!(emitted)
-                push!(event, "process")
-                println("process(): $(event) on thread $(Threads.threadid())")
-                empty!(event)
-                put!(pool, event)
+    function test_map(data, input_ch, output_ch)
+        while true
+            try
+                event = take!(input_ch)
+                push!(event, "map")
+                println("map(): $(event) on thread $(Threads.threadid())")
+                put!(output_ch, event)
+            catch
+                println("Map: Input channel closed! Worker shutting down.")
+                break;
             end
-        catch
-            println("process: Shutdown received on thread $(Threads.threadid())")
-            put!(pool, event)
+        end
+    end
+
+    function test_reduce(data, input_ch, output_ch)
+        while true
+            try
+                event = take!(input_ch)
+                push!(event, "reduce")
+                println("reduce(): $(event) on thread $(Threads.threadid())")
+                empty!(event)
+                put!(output_ch, event)
+            catch
+                println("Reduce: Input channel closed! Worker shutting down.")
+                break;
+            end
         end
     end
 
     function run_basic_example()
-        Base.exit_on_sigint(false)
-        try
-            run(test_source, test_proc)
-        catch ex
-            if isa(ex, InterruptException)
-                println("Interrupted! Exiting")
-#                 println("Pool contains: ")
-#                 for i in pool
-#                     @show i
-#                 end
-#                 println("emitted contains: ")
-#                 for i in emitted
-#                     @show i
-#                 end
+        println("Running basic example")
+        pool = Channel(10)
+        emitted = Channel(10)
+        mapped = Channel(10)
+        for i in 1:8
+            put!(pool, [])
+        end
+        source = Arrow("source", test_source, nothing, pool, emitted, 1, [], nothing)
+        map = Arrow("map", test_map, nothing, emitted, mapped, 4, [], nothing)
+        reduce = Arrow("reduce", test_reduce, nothing, mapped, pool, 1, [], nothing)
+        topology = [source, map, reduce]
+        run(topology)
+
+        for arrow in topology
+            for (id,task) in enumerate(arrow.worker_tasks)
+                if (istaskfailed(task))
+                    println("Arrow $(arrow.name): worker $(id): $(task.result)")
+                else
+                    println("Arrow $(arrow.name): worker $(id): Success")
+                end
+            end
+            if (istaskfailed(arrow.shutdown_task))
+                println("Arrow $(arrow.name): shutdown: $(arrow.shutdown_task.result)")
+            else
+                println("Arrow $(arrow.name): shutdown: Success")
             end
         end
-
     end
-
 end
-
 
 Engine.run_basic_example()
