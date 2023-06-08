@@ -46,7 +46,9 @@ module Engine
                     break;
                 end
             end
+            task_local_storage(:start_time, Dates.now())
             result = arrow.execute(event, arrow.state)
+            task_local_storage(:start_time, 0)  # Tell timeout watchdog that execute() finished
             if (result == :shutdown)
                 @debug("Arrow '$(arrow.name)': worker $(id) shutting down due to end-of-stream.")
                 break;
@@ -64,9 +66,30 @@ module Engine
         end
     end
 
-    function run(arrows; nthreads=Threads.nthreads())
+    function check_for_timeout(arrows, timeout_duration)
+        for arrow in arrows
+            for (worker_id,task) in enumerate(arrow.worker_tasks)
+                if task.storage != nothing
+                    start_time = get(task.storage, :start_time, 0)
+                    if start_time != 0
+                        execution_duration = Dates.now() - start_time
+                        if execution_duration > timeout_duration
+                            @error("Timeout detected", arrow.name, worker_id, execution_duration)
+                            return true
+                            # Ideally, we could do `Base.throwto(task, InterruptException)`, however there are two problems
+                            # 1. I'm 80% sure this requires the hanging task to yield (because Julia uses fibers, not green threads)
+                            # 2. throwto() doesn't support multithreading ("LoadError: cannot switch to task running on another thread")
+                        end
+                    end
+                end
+            end
+        end
+        return false
+    end
+
+    function run(arrows; nthreads=Threads.nthreads(), show_ticker=true, timeout_duration=Dates.Second(5), timeout_warmup_duration=Dates.Second(10), exit_on_timeout=true)
         @info("Welcome to the Juliana event reconstruction framework!")
-        @info("Starting run() with nthreads = $(nthreads)")
+        @info("Starting run()", nthreads, show_ticker, timeout_duration, timeout_warmup_duration)
         for arrow in arrows
             for id in 1:arrow.max_parallelism
                 push!(arrow.worker_tasks, @spawn worker(arrow, id))
@@ -91,20 +114,45 @@ module Engine
         while result != :ok
             try
                 while result != :ok
+                    # Print the processing ticker
                     start_time = Dates.now()
-                    result = Base.timedwait(()->istaskdone(arrows[end].shutdown_task), 1.0; pollint=0.1)
-                    finish_time = Dates.now()
-                    elapsed_time_total = finish_time - run_start_time
-                    elapsed_time_delta = finish_time - start_time
-                    processed_count_total = arrows[end].processed_count[]
-                    processed_count_delta = processed_count_total - last_processed_count
-                    last_processed_count = processed_count_total
-                    avg_rate_hz = round(processed_count_total*1000/elapsed_time_total.value; sigdigits=3)
-                    inst_rate_hz = round(processed_count_delta*1000/elapsed_time_delta.value; sigdigits=3)
-#                     @info("Processed %d events @ avg=%.2f Hz, inst=%.2f Hz\n", processed_count_total, avg_rate_hz, inst_rate_hz)
-                    @info("Juliana status ticker", processed_events_count=processed_count_total, avg_rate_hz, inst_rate_hz)
-                end
+                    if show_ticker
+                        result = Base.timedwait(()->istaskdone(arrows[end].shutdown_task), 1.0; pollint=0.1)
+                        finish_time = Dates.now()
+                        elapsed_time_total = finish_time - run_start_time
+                        elapsed_time_delta = finish_time - start_time
+                        processed_count_total = arrows[end].processed_count[]
+                        processed_count_delta = processed_count_total - last_processed_count
+                        last_processed_count = processed_count_total
+                        avg_rate_hz = round(processed_count_total*1000/elapsed_time_total.value; sigdigits=3)
+                        inst_rate_hz = round(processed_count_delta*1000/elapsed_time_delta.value; sigdigits=3)
+                         @info("Processed $(processed_count_total) events @ avg = $(avg_rate_hz) Hz, inst = $(inst_rate_hz) Hz\n")
+    #                    @info("Event processing in progress", processed_events_count=processed_count_total, avg_rate_hz, inst_rate_hz)
+                    end
 
+                    # Check for timeout. We do this on the interactive/ticker thread instead of a dedicated
+                    # timeout supervisor task for two reasons:
+                    # 1. It makes life slightly easier for the task scheduler, and doesn't interfere with real work
+                    # 2. We don't need to signal to the timeout supervisor when run() has finished
+                    if (timeout_duration != 0)
+                        if (start_time - run_start_time) > timeout_warmup_duration
+                            if check_for_timeout(arrows, timeout_duration)
+                                if exit_on_timeout
+                                    exit(1)
+                                else
+                                    throw(InterruptException)
+                                    # I'm not sure what anyone could realistically do with the InterruptException.
+                                    # They can't kill the offending task or trigger the shutdown logic
+                                    # that is waiting on the task. The caller to run() would be left with
+                                    # a pile of tasks that can't finish. The only option I see right now is to
+                                    # forcibly shut down the topology by closing all channels and calling all
+                                    # arrow finalizers, though we'd still be left with hanging tasks that
+                                    # can always corrupt or data-race the finalizers
+                                 end
+                            end
+                        end
+                    end
+                end
             catch ex
                 if isa(ex, InterruptException)
                     options = ["Continue", "Graceful shutdown", "Hard shutdown"]
@@ -163,6 +211,24 @@ module Engine
             s += sum(rand(300,300).^2)
         end
         return s
+    end
+
+    function randomly_hang(probability=0.05, time_ms=100000)
+        x = rand()
+        if x<probability
+           spin(time_ms)
+        end
+        return 0
+    end
+
+    function randomly_throw(probability=0.05)
+        x = rand()
+        if x<probability
+            @warn "Randomly throwing!"
+           throw(MethodError)
+        end
+        @info "Not randomly throwing"
+        return 0
     end
 
     function test_source(event, state)
