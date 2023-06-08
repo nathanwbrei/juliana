@@ -15,6 +15,7 @@ module Engine
     import Base.Threads.@spawn
     import Dates
     import Printf.@printf
+    import REPL
 
     mutable struct Arrow
         name::String
@@ -35,32 +36,31 @@ module Engine
     function worker(arrow::Arrow, id::Int64)
         println("Arrow '$(arrow.name)': Launched worker $(id)");
         while true
-            try
-                if arrow.input_channel == nothing
-                    event = ()
-                else
+            if arrow.input_channel == nothing
+                event = ()
+            else
+                try
                     event = take!(arrow.input_channel)
-                end
-                result = arrow.execute(event, arrow.state)
-                if (result == :shutdown)
-                    println("Arrow '$(arrow.name)': worker $(id) shutting down.")
+                catch
+                    println("Arrow '$(arrow.name)': worker $(id) shutting down due to closed input channel.")
                     break;
-                end
-#                 println("Arrow '$(arrow.name)': worker $(id), thread $(Threads.threadid()): $(result)")
-                if arrow.output_channel != nothing
-                    put!(arrow.output_channel, result)
-                end
-                Threads.atomic_add!(arrow.processed_count, 1)
-            catch ex
-                if (isa(ex, InvalidStateException))
-                    # InvalidStateException => channel is closed and empty, no more work coming
-                    println("Arrow '$(arrow.name)': worker $(id) shutting down.")
-                    break;
-                else
-                    rethrow(ex)
-                    # All other exceptions are displayed at the end of run
                 end
             end
+            result = arrow.execute(event, arrow.state)
+            if (result == :shutdown)
+                println("Arrow '$(arrow.name)': worker $(id) shutting down.")
+                break;
+            end
+#           println("Arrow '$(arrow.name)': worker $(id), thread $(Threads.threadid()): $(result)")
+            if arrow.output_channel != nothing
+                try
+                    put!(arrow.output_channel, result)
+                catch
+                    println("Arrow '$(arrow.name)': worker $(id) shutting down due to closed output channel.")
+                    break;
+                end
+            end
+            Threads.atomic_add!(arrow.processed_count, 1)
         end
     end
 
@@ -82,32 +82,51 @@ module Engine
             println("Arrow '$(arrow.name)': All workers have started")
         end
         println("All workers have started")
-        try
-            Base.exit_on_sigint(false)
-            run_start_time = Dates.now()
-            last_processed_count = 0
-            result = :timedout
-            while result != :ok
-                start_time = Dates.now()
-                result = Base.timedwait(()->istaskdone(arrows[end].shutdown_task), 1.0; pollint=0.1)
-                finish_time = Dates.now()
-                elapsed_time_total = finish_time - run_start_time
-                elapsed_time_delta = finish_time - start_time
-                processed_count_total = arrows[end].processed_count[]
-                processed_count_delta = processed_count_total - last_processed_count
-                last_processed_count = processed_count_total
-                @printf("Processed %d events @ avg=%.2f Hz, inst=%.2f Hz\n", processed_count_total, processed_count_total*1000/elapsed_time_total.value, processed_count_delta*1000/elapsed_time_delta.value)
-            end
 
-            println("All workers have shut down")
-        catch ex
-            @show ex
-            if isa(ex, InterruptException)
-                println("Interrupted! Exiting")
-            else
-                rethrow(ex)
+        Base.exit_on_sigint(false)
+        run_start_time = Dates.now()
+        last_processed_count = 0
+        result = :timedout
+        while result != :ok
+            try
+                while result != :ok
+                    start_time = Dates.now()
+                    result = Base.timedwait(()->istaskdone(arrows[end].shutdown_task), 1.0; pollint=0.1)
+                    finish_time = Dates.now()
+                    elapsed_time_total = finish_time - run_start_time
+                    elapsed_time_delta = finish_time - start_time
+                    processed_count_total = arrows[end].processed_count[]
+                    processed_count_delta = processed_count_total - last_processed_count
+                    last_processed_count = processed_count_total
+                    @printf("Processed %d events @ avg=%.2f Hz, inst=%.2f Hz\n", processed_count_total, processed_count_total*1000/elapsed_time_total.value, processed_count_delta*1000/elapsed_time_delta.value)
+                end
+
+            catch ex
+                if isa(ex, InterruptException)
+                    options = ["Continue", "Graceful shutdown", "Hard shutdown"]
+                    menu = REPL.TerminalMenus.RadioMenu(options, pagesize=6, charset=:unicode)
+                    choice = REPL.TerminalMenus.request("\nHow would you like to proceed?", menu)
+                    if choice == 2
+                        # Graceful shutdown
+                        close(arrows[1].output_channel)
+                        # This looks really weird, but the worker will shut down if its output channel
+                        # is closed (what else can it do, after all?) If we were to shut down the input channel
+                        # instead, this would cause problems because it would have to drain the event pool,
+                        # and would prematurely shut off the farthest downstream arrow. The only other option
+                        # is to have a shutdown_request flag on each arrow, which I find dissatisfying based
+                        # off of doing exactly that in JANA2. On the other hand, we may eventually want to support
+                        # properly pausing a running topology for the sake of debugging, instead of hacking it using
+                        # JEventProcessors and backpressure.
+                    elseif choice == 3
+                        # Hard shutdown
+                        exit(1)
+                    end
+                else
+                    rethrow(ex)
+                end
             end
         end
+        println("All workers have shut down")
     end
 
     function spin(time_ms)
@@ -185,8 +204,6 @@ Engine.run_basic_example()
 
 
 # Still want:
-# - Clean interrupt
-# - Ticker
 # - Timeout
 # - Split
 
