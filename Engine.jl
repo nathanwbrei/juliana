@@ -74,7 +74,7 @@ module Engine
                     if start_time != 0
                         execution_duration = Dates.now() - start_time
                         if execution_duration > timeout_duration
-                            @error("Timeout detected", arrow.name, worker_id, execution_duration)
+                            @error("Timeout detected", execution_duration, arrow.name, worker_id, task)
                             return true
                             # Ideally, we could do `Base.throwto(task, InterruptException)`, however there are two problems
                             # 1. I'm 80% sure this requires the hanging task to yield (because Julia uses fibers, not green threads)
@@ -85,6 +85,19 @@ module Engine
             end
         end
         return false
+    end
+
+    function check_for_failed_tasks(arrows)
+        found_failed = false
+        for arrow in arrows
+            for (worker_id,task) in enumerate(arrow.worker_tasks)
+                if istaskfailed(task)
+                    found_failed = true
+                    @error("Failed task detected", arrow.name, worker_id, task)
+                end
+            end
+        end
+        return found_failed
     end
 
     function run(arrows; nthreads=Threads.nthreads(), show_ticker=true, timeout_duration=Dates.Second(5), timeout_warmup_duration=Dates.Second(10), exit_on_timeout=true)
@@ -114,20 +127,11 @@ module Engine
         while result != :ok
             try
                 while result != :ok
-                    # Print the processing ticker
                     start_time = Dates.now()
-                    if show_ticker
-                        result = Base.timedwait(()->istaskdone(arrows[end].shutdown_task), 1.0; pollint=0.1)
-                        finish_time = Dates.now()
-                        elapsed_time_total = finish_time - run_start_time
-                        elapsed_time_delta = finish_time - start_time
-                        processed_count_total = arrows[end].processed_count[]
-                        processed_count_delta = processed_count_total - last_processed_count
-                        last_processed_count = processed_count_total
-                        avg_rate_hz = round(processed_count_total*1000/elapsed_time_total.value; sigdigits=3)
-                        inst_rate_hz = round(processed_count_delta*1000/elapsed_time_delta.value; sigdigits=3)
-                         @info("Processed $(processed_count_total) events @ avg = $(avg_rate_hz) Hz, inst = $(inst_rate_hz) Hz\n")
-    #                    @info("Event processing in progress", processed_events_count=processed_count_total, avg_rate_hz, inst_rate_hz)
+
+                    # Check for failed tasks first. This way, we can distinguish between excepted and timedout tasks
+                    if check_for_failed_tasks(arrows)
+                        exit(1)
                     end
 
                     # Check for timeout. We do this on the interactive/ticker thread instead of a dedicated
@@ -151,6 +155,21 @@ module Engine
                                  end
                             end
                         end
+                    end
+
+                    # Print the processing ticker.
+                    if show_ticker
+                        result = Base.timedwait(()->istaskdone(arrows[end].shutdown_task), 1.0; pollint=0.1)
+                        finish_time = Dates.now()
+                        elapsed_time_total = finish_time - run_start_time
+                        elapsed_time_delta = finish_time - start_time
+                        processed_count_total = arrows[end].processed_count[]
+                        processed_count_delta = processed_count_total - last_processed_count
+                        last_processed_count = processed_count_total
+                        avg_rate_hz = round(processed_count_total*1000/elapsed_time_total.value; sigdigits=3)
+                        inst_rate_hz = round(processed_count_delta*1000/elapsed_time_delta.value; sigdigits=3)
+                         @info("Processed $(processed_count_total) events @ avg = $(avg_rate_hz) Hz, inst = $(inst_rate_hz) Hz\n")
+    #                    @info("Event processing in progress", processed_events_count=processed_count_total, avg_rate_hz, inst_rate_hz)
                     end
                 end
             catch ex
@@ -185,24 +204,7 @@ module Engine
         for arrow in arrows
             processed_counts[arrow.name] = arrow.processed_count[]
         end
-        @info("All workers have shut down", elapsed_time, processed_counts)
-
-        for arrow in arrows
-            for (id,task) in enumerate(arrow.worker_tasks)
-                if (istaskfailed(task))
-                    @error("Arrow '$(arrow.name)': worker $(id): $(task.result)")
-                    errormonitor(task)
-                else
-#                     println("$(arrow.name):$(id): Success")
-                end
-            end
-            if (istaskfailed(arrow.shutdown_task))
-                @error("Arrow '$(arrow.name)': shutdown: $(arrow.shutdown_task.result)")
-                errormonitor(task)
-            else
-#                 println("$(arrow.name):shutdown: Success")
-            end
-        end
+        @info("All workers have shut down successfully", elapsed_time, processed_counts)
     end
 
     function spin(time_ms)
@@ -225,7 +227,7 @@ module Engine
         x = rand()
         if x<probability
             @warn "Randomly throwing!"
-           throw(MethodError)
+            error("Some exception happens!")
         end
         @info "Not randomly throwing"
         return 0
@@ -251,7 +253,7 @@ module Engine
         emitted = Channel(20)
         mapped = Channel(20)
         source = Arrow("source", test_source, SourceState(0, 100), pool, emitted, 1)
-        map    = Arrow("map", (event,state)->push!(event, "map $(spin(500))"), nothing, emitted, mapped, 4)
+        map    = Arrow("map", (event,state)->push!(event, "map $(spin(500)) $(randomly_throw())"), nothing, emitted, mapped, 4)
         reduce = Arrow("reduce", (event,state)->push!(event, "reduce $(spin(200))"), nothing, mapped, pool, 1)
         topology = [source, map, reduce]
         @spawn begin
