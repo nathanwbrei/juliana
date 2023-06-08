@@ -12,6 +12,7 @@ julia>
 ```
 """
 module Engine
+    import Base.Threads.@spawn
 
     mutable struct Arrow
         name::String
@@ -20,11 +21,14 @@ module Engine
         input_channel::Channel
         output_channel::Channel
         max_parallelism::Int64
+        processed_count::Threads.Atomic{Int64}
         worker_tasks::Vector{Task}
         shutdown_task::Union{Task,Nothing}
-    end
 
-    import Base.Threads.@spawn
+        function Arrow(name, execute, state, input_channel, output_channel, max_parallelism)
+            new(name, execute, state, input_channel, output_channel, max_parallelism, Threads.Atomic{Int64}(0), [], nothing)
+        end
+    end
 
     function worker(arrow::Arrow, id::Int64)
         println("Arrow '$(arrow.name)': Launched worker $(id)");
@@ -44,6 +48,7 @@ module Engine
                 if arrow.output_channel != nothing
                     put!(arrow.output_channel, result)
                 end
+                Threads.atomic_add!(arrow.processed_count, 1)
             catch ex
                 if (isa(ex, InvalidStateException))
                     # InvalidStateException => channel is closed and empty, no more work coming
@@ -55,8 +60,6 @@ module Engine
                 end
             end
         end
-
-
     end
 
     function run(arrows; nthreads=Threads.nthreads())
@@ -137,30 +140,40 @@ module Engine
                 put!(pool, Vector{String}())
             end
         end
-        source = Arrow("source", test_source, SourceState(0, 120), pool, emitted, 1, [], nothing)
-        map = Arrow("map", test_map, nothing, emitted, mapped, 4, [], nothing)
-        reduce = Arrow("reduce", test_reduce, nothing, mapped, pool, 1, [], nothing)
+        source = Arrow("source", test_source, SourceState(0, 50), pool, emitted, 1)
+        map    = Arrow("map", test_map, nothing, emitted, mapped, 4)
+        reduce = Arrow("reduce", test_reduce, nothing, mapped, pool, 1)
         topology = [source, map, reduce]
         run(topology)
 
         println("------------")
-        println("Run finished.")
+        println("Run finished")
+        println("------------")
 
         for arrow in topology
+            println("$(arrow.name): Processed $(arrow.processed_count[])")
             for (id,task) in enumerate(arrow.worker_tasks)
                 if (istaskfailed(task))
                     println("Arrow '$(arrow.name)': worker $(id): $(task.result)")
                 else
-#                     println("Arrow '$(arrow.name)': worker $(id): Success")
+#                     println("$(arrow.name):$(id): Success")
                 end
             end
             if (istaskfailed(arrow.shutdown_task))
                 println("Arrow '$(arrow.name)': shutdown: $(arrow.shutdown_task.result)")
             else
-#                 println("Arrow '$(arrow.name)': shutdown: Success")
+#                 println("$(arrow.name):shutdown: Success")
             end
         end
     end
 end
 
 Engine.run_basic_example()
+
+
+# Still want:
+# - Clean interrupt
+# - Ticker
+# - Timeout
+# - Split
+
