@@ -34,7 +34,7 @@ module Engine
     end
 
     function worker(arrow::Arrow, id::Int64)
-        println("Arrow '$(arrow.name)': Launched worker $(id)");
+        @debug("Arrow '$(arrow.name)': Launched worker $(id)");
         while true
             if arrow.input_channel == nothing
                 event = ()
@@ -42,21 +42,21 @@ module Engine
                 try
                     event = take!(arrow.input_channel)
                 catch
-                    println("Arrow '$(arrow.name)': worker $(id) shutting down due to closed input channel.")
+                    @debug("Arrow '$(arrow.name)': worker $(id) shutting down due to closed input channel.")
                     break;
                 end
             end
             result = arrow.execute(event, arrow.state)
             if (result == :shutdown)
-                println("Arrow '$(arrow.name)': worker $(id) shutting down.")
+                @debug("Arrow '$(arrow.name)': worker $(id) shutting down due to end-of-stream.")
                 break;
             end
-#           println("Arrow '$(arrow.name)': worker $(id), thread $(Threads.threadid()): $(result)")
+            @debug("Arrow '$(arrow.name)': worker $(id), thread $(Threads.threadid()): $(result)")
             if arrow.output_channel != nothing
                 try
                     put!(arrow.output_channel, result)
                 catch
-                    println("Arrow '$(arrow.name)': worker $(id) shutting down due to closed output channel.")
+                    @debug("Arrow '$(arrow.name)': worker $(id) shutting down due to closed output channel.")
                     break;
                 end
             end
@@ -65,23 +65,24 @@ module Engine
     end
 
     function run(arrows; nthreads=Threads.nthreads())
-        println("Starting run() with nthreads = $(nthreads)")
+        @info("Welcome to the Juliana event reconstruction framework!")
+        @info("Starting run() with nthreads = $(nthreads)")
         for arrow in arrows
             for id in 1:arrow.max_parallelism
                 push!(arrow.worker_tasks, @spawn worker(arrow, id))
             end
 
             arrow.shutdown_task = @spawn begin
-                println("Arrow '$(arrow.name)': Launched shutdown task")
+                @debug("Arrow '$(arrow.name)': Launched shutdown task")
                 for w in arrow.worker_tasks
                     wait(w)
                 end
                 close(arrow.output_channel)
-                println("Arrow '$(arrow.name)': All workers have shut down")
+                @debug("Arrow '$(arrow.name)': All workers have shut down")
             end
-            println("Arrow '$(arrow.name)': All workers have started")
+            @debug("Arrow '$(arrow.name)': All workers have started")
         end
-        println("All workers have started")
+        @debug("All workers have started")
 
         Base.exit_on_sigint(false)
         run_start_time = Dates.now()
@@ -98,7 +99,10 @@ module Engine
                     processed_count_total = arrows[end].processed_count[]
                     processed_count_delta = processed_count_total - last_processed_count
                     last_processed_count = processed_count_total
-                    @printf("Processed %d events @ avg=%.2f Hz, inst=%.2f Hz\n", processed_count_total, processed_count_total*1000/elapsed_time_total.value, processed_count_delta*1000/elapsed_time_delta.value)
+                    avg_rate_hz = round(processed_count_total*1000/elapsed_time_total.value; sigdigits=3)
+                    inst_rate_hz = round(processed_count_delta*1000/elapsed_time_delta.value; sigdigits=3)
+#                     @info("Processed %d events @ avg=%.2f Hz, inst=%.2f Hz\n", processed_count_total, avg_rate_hz, inst_rate_hz)
+                    @info("Juliana status ticker", processed_events_count=processed_count_total, avg_rate_hz, inst_rate_hz)
                 end
 
             catch ex
@@ -107,6 +111,7 @@ module Engine
                     menu = REPL.TerminalMenus.RadioMenu(options, pagesize=6, charset=:unicode)
                     choice = REPL.TerminalMenus.request("\nHow would you like to proceed?", menu)
                     if choice == 2
+                        @warn("Starting graceful shutdown")
                         # Graceful shutdown
                         close(arrows[1].output_channel)
                         # This looks really weird, but the worker will shut down if its output channel
@@ -119,6 +124,7 @@ module Engine
                         # JEventProcessors and backpressure.
                     elseif choice == 3
                         # Hard shutdown
+                        @warn("Hard shutdown")
                         exit(1)
                     end
                 else
@@ -126,7 +132,29 @@ module Engine
                 end
             end
         end
-        println("All workers have shut down")
+        elapsed_time = round(Dates.now() - run_start_time, Dates.Second)
+        processed_counts = Dict{String, Int64}()
+        for arrow in arrows
+            processed_counts[arrow.name] = arrow.processed_count[]
+        end
+        @info("All workers have shut down", elapsed_time, processed_counts)
+
+        for arrow in arrows
+            for (id,task) in enumerate(arrow.worker_tasks)
+                if (istaskfailed(task))
+                    @error("Arrow '$(arrow.name)': worker $(id): $(task.result)")
+                    errormonitor(task)
+                else
+#                     println("$(arrow.name):$(id): Success")
+                end
+            end
+            if (istaskfailed(arrow.shutdown_task))
+                @error("Arrow '$(arrow.name)': shutdown: $(arrow.shutdown_task.result)")
+                errormonitor(task)
+            else
+#                 println("$(arrow.name):shutdown: Success")
+            end
+        end
     end
 
     function spin(time_ms)
@@ -140,21 +168,11 @@ module Engine
     function test_source(event, state)
         if state.last_event<state.max_event_count
             state.last_event += 1
-            fresh_event = ["emit $(state.last_event) $(spin(0))"]
+            fresh_event = ["emit $(state.last_event) $(spin(100))"]
             return fresh_event
         else
             return :shutdown
         end
-    end
-
-    function test_map(event, state)
-        push!(event, "map $(spin(0))")
-        return event
-    end
-
-    function test_reduce(event, state)
-        push!(event, "reduce $(spin(0))")
-        return event
     end
 
     mutable struct SourceState
@@ -163,40 +181,19 @@ module Engine
     end
 
     function run_basic_example()
-        println("Running basic example")
         pool = Channel(20)
         emitted = Channel(20)
         mapped = Channel(20)
+        source = Arrow("source", test_source, SourceState(0, 100), pool, emitted, 1)
+        map    = Arrow("map", (event,state)->push!(event, "map $(spin(500))"), nothing, emitted, mapped, 4)
+        reduce = Arrow("reduce", (event,state)->push!(event, "reduce $(spin(200))"), nothing, mapped, pool, 1)
+        topology = [source, map, reduce]
         @spawn begin
             for i in 1:20
                 put!(pool, Vector{String}())
             end
         end
-        source = Arrow("source", test_source, SourceState(0, 5000000), pool, emitted, 1)
-        map    = Arrow("map", test_map, nothing, emitted, mapped, 4)
-        reduce = Arrow("reduce", test_reduce, nothing, mapped, pool, 1)
-        topology = [source, map, reduce]
         run(topology)
-
-        println("------------")
-        println("Run finished")
-        println("------------")
-
-        for arrow in topology
-            println("$(arrow.name): Processed $(arrow.processed_count[])")
-            for (id,task) in enumerate(arrow.worker_tasks)
-                if (istaskfailed(task))
-                    println("Arrow '$(arrow.name)': worker $(id): $(task.result)")
-                else
-#                     println("$(arrow.name):$(id): Success")
-                end
-            end
-            if (istaskfailed(arrow.shutdown_task))
-                println("Arrow '$(arrow.name)': shutdown: $(arrow.shutdown_task.result)")
-            else
-#                 println("$(arrow.name):shutdown: Success")
-            end
-        end
     end
 end
 
