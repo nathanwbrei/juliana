@@ -14,7 +14,6 @@ julia>
 module Engine
     import Base.Threads.@spawn
     import Dates
-    import Printf.@printf
     import REPL
 
     mutable struct Arrow
@@ -100,6 +99,19 @@ module Engine
         return found_failed
     end
 
+    function graceful_shutdown(arrows)
+        @warn("Starting graceful shutdown")
+        close(arrows[1].output_channel)
+        # This looks really weird, but the worker will shut down if its output channel
+        # is closed (what else can it do, after all?) If we were to shut down the input channel
+        # instead, this would cause problems because it would have to drain the event pool,
+        # and would prematurely shut off the farthest downstream arrow. The only other option
+        # is to have a shutdown_request flag on each arrow, which I find dissatisfying based
+        # off of doing exactly that in JANA2. On the other hand, we may eventually want to support
+        # properly pausing a running topology for the sake of debugging, instead of hacking it using
+        # JEventProcessors and backpressure.
+    end
+
     function run(arrows; nthreads=Threads.nthreads(), show_ticker=true, timeout_duration=Dates.Second(5), timeout_warmup_duration=Dates.Second(10), exit_on_timeout=true)
         @info("Welcome to the Juliana event reconstruction framework!")
         @info("Starting run()", nthreads, show_ticker, timeout_duration, timeout_warmup_duration)
@@ -168,8 +180,8 @@ module Engine
                         last_processed_count = processed_count_total
                         avg_rate_hz = round(processed_count_total*1000/elapsed_time_total.value; sigdigits=3)
                         inst_rate_hz = round(processed_count_delta*1000/elapsed_time_delta.value; sigdigits=3)
-                         @info("Processed $(processed_count_total) events @ avg = $(avg_rate_hz) Hz, inst = $(inst_rate_hz) Hz\n")
-    #                    @info("Event processing in progress", processed_events_count=processed_count_total, avg_rate_hz, inst_rate_hz)
+                        @info("Processed $(processed_count_total) events @ avg = $(avg_rate_hz) Hz, inst = $(inst_rate_hz) Hz\n")
+    #                   @info("Event processing in progress", processed_events_count=processed_count_total, avg_rate_hz, inst_rate_hz)
                     end
                 end
             catch ex
@@ -178,17 +190,7 @@ module Engine
                     menu = REPL.TerminalMenus.RadioMenu(options, pagesize=6, charset=:unicode)
                     choice = REPL.TerminalMenus.request("\nHow would you like to proceed?", menu)
                     if choice == 2
-                        @warn("Starting graceful shutdown")
-                        # Graceful shutdown
-                        close(arrows[1].output_channel)
-                        # This looks really weird, but the worker will shut down if its output channel
-                        # is closed (what else can it do, after all?) If we were to shut down the input channel
-                        # instead, this would cause problems because it would have to drain the event pool,
-                        # and would prematurely shut off the farthest downstream arrow. The only other option
-                        # is to have a shutdown_request flag on each arrow, which I find dissatisfying based
-                        # off of doing exactly that in JANA2. On the other hand, we may eventually want to support
-                        # properly pausing a running topology for the sake of debugging, instead of hacking it using
-                        # JEventProcessors and backpressure.
+                        graceful_shutdown(arrows)
                     elseif choice == 3
                         # Hard shutdown
                         @warn("Hard shutdown")
@@ -207,68 +209,9 @@ module Engine
         @info("All workers have shut down successfully", elapsed_time, processed_counts)
     end
 
-    function spin(time_ms)
-        s = 0
-        for i = 1:time_ms
-            s += sum(rand(300,300).^2)
-        end
-        return s
-    end
-
-    function randomly_hang(probability=0.05, time_ms=100000)
-        x = rand()
-        if x<probability
-           spin(time_ms)
-        end
-        return 0
-    end
-
-    function randomly_throw(probability=0.05)
-        x = rand()
-        if x<probability
-            @warn "Randomly throwing!"
-            error("Some exception happens!")
-        end
-        @info "Not randomly throwing"
-        return 0
-    end
-
-    function test_source(event, state)
-        if state.last_event<state.max_event_count
-            state.last_event += 1
-            fresh_event = ["emit $(state.last_event) $(spin(100))"]
-            return fresh_event
-        else
-            return :shutdown
-        end
-    end
-
-    mutable struct SourceState
-        last_event::Int64
-        max_event_count::Int64
-    end
-
-    function run_basic_example()
-        pool = Channel(20)
-        emitted = Channel(20)
-        mapped = Channel(20)
-        source = Arrow("source", test_source, SourceState(0, 100), pool, emitted, 1)
-        map    = Arrow("map", (event,state)->push!(event, "map $(spin(500)) $(randomly_throw())"), nothing, emitted, mapped, 4)
-        reduce = Arrow("reduce", (event,state)->push!(event, "reduce $(spin(200))"), nothing, mapped, pool, 1)
-        topology = [source, map, reduce]
-        @spawn begin
-            for i in 1:20
-                put!(pool, Vector{String}())
-            end
-        end
-        run(topology)
-    end
 end
-
-Engine.run_basic_example()
 
 
 # Still want:
-# - Timeout
 # - Split
 
