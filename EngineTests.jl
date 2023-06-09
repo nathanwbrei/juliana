@@ -190,11 +190,35 @@ module EngineTests
         end
         run(topology)
     end
+
+    function run_benchmark(max_threads=8)
+        results = []
+        for nthreads in 1:max_threads
+            @warn("Starting run", nthreads)
+            pool = Channel(50)
+            emitted = Channel(50)
+            mapped = Channel(50)
+            source = Arrow("source", test_source, SourceState(0, 100, 100), pool, emitted, 1)
+            map    = Arrow("map", (event,state)->push!(event, "map $(spin(500))"), nothing, emitted, mapped, nthreads)
+            reduce = Arrow("reduce", (event,state)->push!(event, "reduce $(spin(200))"), nothing, mapped, pool, 1)
+            topology = [source, map, reduce]
+            Threads.@spawn begin
+                for i in 1:50
+                    put!(pool, Vector{String}())
+                end
+            end
+            elapsed_time, processed_count = run(topology; nthreads=nthreads)
+            rate = processed_count*1000/elapsed_time.value
+            push!(results, nthreads=>rate)
+            @warn("Finishing run", nthreads, rate)
+        end
+        @warn("Finished benchmarking", results)
+    end
 end
 
 import REPL
-options = ["Run basic example", "Run interrupted example", "Run timeout example", "Run excepting example", "Run fast example", "Run initialize example"]
-funs = [EngineTests.run_basic_example, EngineTests.run_interrupted_example, EngineTests.run_timeout_example, EngineTests.run_excepting_example, EngineTests.run_fast_example, EngineTests.run_initialize_example]
+options = ["Run basic example", "Run interrupted example", "Run timeout example", "Run excepting example", "Run fast example", "Run initialize example", "Run benchmark"]
+funs = [EngineTests.run_basic_example, EngineTests.run_interrupted_example, EngineTests.run_timeout_example, EngineTests.run_excepting_example, EngineTests.run_fast_example, EngineTests.run_initialize_example, EngineTests.run_benchmark]
 menu = REPL.TerminalMenus.RadioMenu(options, pagesize=6, charset=:unicode)
 choice = REPL.TerminalMenus.request("What would you like to do?", menu)
 funs[choice]()

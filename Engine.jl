@@ -199,7 +199,7 @@ module Engine
                 end
             catch ex
                 if isa(ex, InterruptException)
-                    options = ["Continue", "Graceful shutdown", "Hard shutdown"]
+                    options = ["Continue", "Graceful shutdown", "Hard shutdown", "Debug info"]
                     menu = REPL.TerminalMenus.RadioMenu(options, pagesize=6, charset=:unicode)
                     choice = REPL.TerminalMenus.request("\nHow would you like to proceed?", menu)
                     if choice == 2
@@ -208,18 +208,38 @@ module Engine
                         # Hard shutdown
                         @warn("Hard shutdown")
                         exit(1)
+                    elseif choice == 4
+
+                        for arrow in arrows
+                            in_items = arrow.input_channel.n_avail_items
+                            in_max_items = arrow.input_channel.sz_max
+                            if (in_items == 0)
+                                @warn("Arrow '$(arrow.name)': input channel has 0 items ($(in_max_items) max)")
+                            else
+                                @info("Arrow '$(arrow.name)': input channel has $(in_items) items ($(in_max_items) max)")
+                            end
+                            out_items = arrow.output_channel.n_avail_items
+                            out_max_items = arrow.output_channel.sz_max
+                            if (out_items >= out_max_items)
+                                @warn("Arrow '$(arrow.name)': output channel has $(out_items) items ($(out_max_items) max)")
+                            else
+                                @info("Arrow '$(arrow.name)': output channel has $(out_items) items ($(out_max_items) max)")
+                            end
+                        end
                     end
                 else
                     rethrow(ex)
                 end
             end
         end
-        elapsed_time = round(Dates.now() - run_start_time, Dates.Second)
+        elapsed_time_ms = Dates.now() - run_start_time
+        elapsed_time_secs = round(elapsed_time_ms, Dates.Second)
         processed_counts = Dict{String, Int64}()
         for arrow in arrows
             processed_counts[arrow.name] = arrow.processed_count[]
         end
-        @info("All workers have shut down successfully", elapsed_time, processed_counts)
+        @info("All workers have shut down successfully", elapsed_time_secs, processed_counts)
+        return (elapsed_time_ms, last_processed_count)
     end
 
 end
