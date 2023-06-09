@@ -16,9 +16,12 @@ module Engine
     import Dates
     import REPL
 
+
     mutable struct Arrow
         name::String
         execute::Function
+        initialize::Function
+        finalize::Function
         state::Any
         input_channel::Channel
         output_channel::Channel
@@ -28,7 +31,12 @@ module Engine
         shutdown_task::Union{Task,Nothing}
 
         function Arrow(name, execute, state, input_channel, output_channel, max_parallelism)
-            new(name, execute, state, input_channel, output_channel, max_parallelism, Threads.Atomic{Int64}(0), [], nothing)
+            new(name, execute, state->state, state->state, state, input_channel, output_channel, max_parallelism, Threads.Atomic{Int64}(0), [], nothing)
+        end
+
+
+        function Arrow(name, execute, initialize, finalize, state, input_channel, output_channel, max_parallelism)
+            new(name, execute, initialize, finalize, state, input_channel, output_channel, max_parallelism, Threads.Atomic{Int64}(0), [], nothing)
         end
     end
 
@@ -116,6 +124,9 @@ module Engine
         @info("Welcome to the Juliana event reconstruction framework!")
         @info("Starting run()", nthreads, show_ticker, timeout_duration, timeout_warmup_duration)
         for arrow in arrows
+            arrow.state = arrow.initialize(arrow.state)
+            @debug("Arrow '$(arrow.name)': Initialized")
+
             for id in 1:arrow.max_parallelism
                 push!(arrow.worker_tasks, @spawn worker(arrow, id))
             end
@@ -127,6 +138,8 @@ module Engine
                 end
                 close(arrow.output_channel)
                 @debug("Arrow '$(arrow.name)': All workers have shut down")
+                arrow.state = arrow.finalize(arrow.state)
+                @debug("Arrow '$(arrow.name)': Finalized")
             end
             @debug("Arrow '$(arrow.name)': All workers have started")
         end

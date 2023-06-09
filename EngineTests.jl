@@ -88,7 +88,6 @@ module EngineTests
                 put!(pool, Vector{String}())
             end
         end
-        interactive_task = Base.current_task()
         Threads.@spawn begin
             @warn("Triggering graceful shutdown in 5 seconds...")
             sleep(5)
@@ -120,6 +119,9 @@ module EngineTests
         spin(500)
         randomly_throw()
         return push!(event, "map")
+    end
+
+    function init(state)
     end
 
 
@@ -158,11 +160,41 @@ module EngineTests
         run(topology)
     end
 
+
+    function init_source(state)
+        @info("Initializing source")
+        return state
+    end
+
+    function finish_sink(state)
+        @info("Finalizing reduce")
+        return state
+    end
+
+    function id(state)
+        return state
+    end
+
+    function run_initialize_example()
+        pool = Channel(20)
+        emitted = Channel(20)
+        mapped = Channel(20)
+        source = Arrow("source", test_source, init_source, id, SourceState(0, 100, 100), pool, emitted, 1)
+        map    = Arrow("map", (event,state)->push!(event, "map $(spin(500))"), nothing, emitted, mapped, 4)
+        reduce = Arrow("reduce", (event,state)->push!(event, "reduce $(spin(200))"), id, finish_sink, nothing, mapped, pool, 1)
+        topology = [source, map, reduce]
+        Threads.@spawn begin
+            for i in 1:20
+                put!(pool, Vector{String}())
+            end
+        end
+        run(topology)
+    end
 end
 
 import REPL
-options = ["Run basic example", "Run interrupted example", "Run timeout example", "Run excepting example", "Run fast example"]
-funs = [EngineTests.run_basic_example, EngineTests.run_interrupted_example, EngineTests.run_timeout_example, EngineTests.run_excepting_example, EngineTests.run_fast_example]
+options = ["Run basic example", "Run interrupted example", "Run timeout example", "Run excepting example", "Run fast example", "Run initialize example"]
+funs = [EngineTests.run_basic_example, EngineTests.run_interrupted_example, EngineTests.run_timeout_example, EngineTests.run_excepting_example, EngineTests.run_fast_example, EngineTests.run_initialize_example]
 menu = REPL.TerminalMenus.RadioMenu(options, pagesize=6, charset=:unicode)
 choice = REPL.TerminalMenus.request("What would you like to do?", menu)
 funs[choice]()
