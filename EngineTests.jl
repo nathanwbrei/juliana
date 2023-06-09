@@ -198,9 +198,9 @@ module EngineTests
             pool = Channel(50)
             emitted = Channel(50)
             mapped = Channel(50)
-            source = Arrow("source", test_source, SourceState(0, 100, 100), pool, emitted, 1)
+            source = Arrow("source", test_source, SourceState(0, 100, 10), pool, emitted, 1)
             map    = Arrow("map", (event,state)->push!(event, "map $(spin(500))"), nothing, emitted, mapped, nthreads)
-            reduce = Arrow("reduce", (event,state)->push!(event, "reduce $(spin(200))"), nothing, mapped, pool, 1)
+            reduce = Arrow("reduce", (event,state)->push!(event, "reduce $(spin(20))"), nothing, mapped, pool, 1)
             topology = [source, map, reduce]
             Threads.@spawn begin
                 for i in 1:50
